@@ -696,7 +696,7 @@ class DNSPentestingAutomation:
                 lowered = text.lower()
                 return any(tok.lower() in lowered for tok in tokens)
             
-            def select_evidence(text: str, tokens, max_lines: int = 5):
+            def select_evidence(text: str, tokens, max_lines: int = 15):
                 if not text:
                     return []
                 evid = []
@@ -750,17 +750,73 @@ class DNSPentestingAutomation:
                     )
                 
                 elif name == "DNS SRV Record Enumeration":
-                    if contains_any(text, ["srv", "service", "port", "priority", "weight"]):
+                    # Check for errors first (no targets, failed scan, etc.)
+                    if contains_any(text, ["no targets were specified", "0 hosts scanned", "failed", "error", "warning: no targets"]):
+                        return (
+                            "not vulnerable",
+                            "SRV enumeration failed or no targets specified - cannot determine vulnerability.",
+                            select_evidence(text, ["no targets", "0 hosts", "failed", "error", "warning"]),
+                        )
+                    # Check for actual SRV records - look for data rows, not just headers
+                    # Real SRV records would have: service name, priority number, weight number, and hostname
+                    # Empty table would only have header row with "service  prio  weight  host"
+                    lines = text.splitlines()
+                    has_actual_records = False
+                    header_found = False
+                    data_rows = 0
+                    
+                    for line in lines:
+                        line_lower = line.lower().strip()
+                        # Check for header row
+                        if "service" in line_lower and ("prio" in line_lower or "priority" in line_lower) and "weight" in line_lower:
+                            header_found = True
+                            continue
+                        # Check for actual data rows (should have service name, numbers, and hostname)
+                        # Skip separator lines (like "|" or "---")
+                        if line.strip() and not line.strip().startswith("|") and not line.strip().startswith("-"):
+                            # Check if line looks like SRV data (has service name pattern like _service._tcp or _service._udp)
+                            if ("_tcp" in line_lower or "_udp" in line_lower or 
+                                (any(char.isdigit() for char in line) and any(char.isalpha() for char in line) and len(line.split()) >= 3)):
+                                # Additional check: should have numbers (priority/weight) and a hostname
+                                parts = line.split()
+                                if len(parts) >= 4:  # service, prio, weight, host
+                                    try:
+                                        # Try to parse priority and weight as numbers
+                                        int(parts[1])  # priority
+                                        int(parts[2])  # weight
+                                        has_actual_records = True
+                                        data_rows += 1
+                                    except (ValueError, IndexError):
+                                        pass
+                    
+                    # If we found actual SRV record data
+                    if has_actual_records and data_rows > 0:
                         return (
                             "vulnerable",
-                            "SRV records discovered revealing service information.",
-                            select_evidence(text, ["srv", "service", "port", "priority", "weight", "target"]),
+                            f"SRV records discovered revealing service information ({data_rows} record(s) found).",
+                            select_evidence(text, ["srv", "service", "port", "priority", "weight", "target", "_tcp", "_udp"]),
                         )
+                    # If header exists but no data rows, no records found
+                    if header_found and not has_actual_records:
+                        return (
+                            "not vulnerable",
+                            "SRV enumeration completed but no SRV records found (empty result table).",
+                            select_evidence(text, ["srv", "service", "prio", "weight", "host", "enumeration"]),
+                        )
+                    # Generic check for SRV keywords (fallback)
+                    if contains_any(text, ["srv", "service"]) and not contains_any(text, ["no srv", "no records", "0 records"]):
+                        # Double-check: make sure it's not just the header
+                        if not (header_found and not has_actual_records):
+                            return (
+                                "vulnerable",
+                                "SRV records discovered revealing service information.",
+                                select_evidence(text, ["srv", "service", "port", "priority", "weight", "target"]),
+                            )
                     if text:
                         return (
                             "not vulnerable",
                             "SRV enumeration completed but no service records found.",
-                            select_evidence(text, ["srv", "enumeration", "completed"]),
+                            select_evidence(text, ["srv", "enumeration", "completed", "no records"]),
                         )
                     return (
                         "No output captured.",
@@ -883,17 +939,53 @@ class DNSPentestingAutomation:
                     )
                 
                 elif name == "DNS Service Discovery (DNS-SD/mDNS)":
-                    if contains_any(text, ["mdns", "dns-sd", "service", "discovery", "advertised"]):
+                    # Check if port is filtered or closed - not vulnerable in this case
+                    if contains_any(text, ["filtered", "closed"]) and not contains_any(text, ["open"]):
+                        return (
+                            "not vulnerable",
+                            "DNS service discovery cannot proceed as port is filtered or closed.",
+                            select_evidence(text, ["filtered", "closed", "port", "state"]),
+                        )
+                    # Check if port is open and actual services were discovered
+                    # Look for actual service discovery results, not just keywords
+                    # Real service discovery would show service names, records, or specific discovery output
+                    if contains_any(text, ["open"]) and (
+                        contains_any(text, ["_tcp", "_udp", "._", "service instance", "service type", "service name"]) or
+                        (contains_any(text, ["advertised"]) and not contains_any(text, ["no services", "no advertised"]))
+                    ):
                         return (
                             "vulnerable",
-                            "DNS service discovery revealed advertised services.",
-                            select_evidence(text, ["mdns", "dns-sd", "service", "discovery", "advertised"]),
+                            "DNS service discovery revealed advertised services on open port.",
+                            select_evidence(text, ["open", "advertised", "_tcp", "_udp", "service"]),
+                        )
+                    # Check for mDNS/DNS-SD specific indicators of actual discovery
+                    if contains_any(text, ["mdns", "dns-sd"]) and contains_any(text, ["open"]) and not contains_any(text, ["filtered", "closed"]):
+                        # Additional check: look for actual service records, not just the script name
+                        if any(keyword in text.lower() for keyword in ["._", "service instance", "service type", "ptr record"]):
+                            return (
+                                "vulnerable",
+                                "DNS service discovery (mDNS/DNS-SD) revealed advertised services.",
+                                select_evidence(text, ["mdns", "dns-sd", "service", "advertised", "ptr"]),
+                            )
+                    # Port is open but no services found
+                    if contains_any(text, ["open"]) and not contains_any(text, ["_tcp", "_udp", "advertised", "service instance"]):
+                        return (
+                            "not vulnerable",
+                            "DNS service discovery completed on open port but no services found.",
+                            select_evidence(text, ["open", "completed", "no services"]),
+                        )
+                    # Port is filtered/closed (already handled above, but catch any edge cases)
+                    if text and not contains_any(text, ["open"]):
+                        return (
+                            "not vulnerable",
+                            "DNS service discovery cannot proceed as port is not accessible.",
+                            select_evidence(text, ["port", "state", "filtered", "closed"]),
                         )
                     if text:
                         return (
                             "not vulnerable",
                             "DNS service discovery completed but no services found.",
-                            select_evidence(text, ["mdns", "dns-sd", "discovery", "completed"]),
+                            select_evidence(text, ["dns", "discovery", "completed"]),
                         )
                     return (
                         "No output captured.",
